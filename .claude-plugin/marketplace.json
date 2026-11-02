@@ -1,6 +1,13 @@
 {
   "name": "ai-audit-trail",
-  "owner": { "name": "Tsai Cheng-Yeh", "url": "https://github.com/Ruxiu0409" },
+  "owner": {
+    "name": "Tsai Cheng-Yeh",
+    "url": "https://github.com/Ruxiu0409"
+  },
+  "metadata": {
+    "description": "Claude Code plugin for exporting conversations as verifiable audit packages for academic AI-use disclosure.",
+    "version": "1.0.0"
+  },
   "plugins": [
     {
       "name": "ai-audit-trail",
