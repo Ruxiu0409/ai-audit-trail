@@ -1,6 +1,6 @@
 {
   "name": "ai-audit-trail",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Export Claude Code conversations as a verifiable audit package (PDF + raw JSONL + SHA-256 manifest, optional RFC 3161 timestamp) for academic AI-use disclosure.",
   "author": { "name": "Tsai Cheng-Yeh", "url": "https://github.com/Ruxiu0409" },
   "homepage": "https://github.com/Ruxiu0409/ai-audit-trail",

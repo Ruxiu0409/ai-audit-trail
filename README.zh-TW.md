@@ -20,13 +20,25 @@
 ```
 ai-audit-trail_<UTC時間>_<session前8碼>/
 ├── transcript.pdf   可讀版：封面詮釋資料＋逐則對話（提問、回覆、推理摘要、工具呼叫與結果）
-├── raw/*.jsonl      Claude Code 原始紀錄（原始證據，含子代理紀錄）
-├── manifest.json    模型、Claude Code 版本、起訖時間、論文資訊、各檔 SHA-256
+├── transcripts/     已遮蔽個資的 Claude Code 紀錄 JSONL（含子代理紀錄）
+├── manifest.json    模型、Claude Code 版本、起訖時間、論文資訊、遮蔽統計、各檔遮蔽前後的 SHA-256
 ├── SHA256SUMS       全部檔案雜湊值
 ├── SHA256SUMS.tsr   （選用）RFC 3161 第三方可信時間戳
 └── README.txt       給審查者的驗證說明
 ```
-另外會產生同名 `.zip`。
+另外會產生同名的 `.zip`，以及一個獨立的 `….PRIVATE/` 資料夾，裡面是未遮蔽的原始檔。這個資料夾只給你自己保存，不會被打包進 zip。
+
+## 預設保護個資
+
+可提交的封存包會移除系統訊息、遮蔽個人資料，但保留對話內容和 **AI 讀過的檔案內容**：
+
+| | 內容 |
+|---|---|
+| **移除** | 系統提示詞、環境／帳號／組織資訊、`<system-reminder>` 區塊、內部遙測欄位 |
+| **遮蔽成 `[REDACTED:類別]`** | email、家目錄路徑裡的使用者名稱、git 姓名與 email、主機名稱、帳號／組織 UUID、API 金鑰／token／密碼／私鑰、身分證字號、電話、公開 IP，以及你用 `--redact-term` 指定的字詞（例如真實姓名、學號） |
+| **保留** | 提問、回覆、推理摘要、工具呼叫與結果、AI 讀過的檔案內容、附加檔案、時間戳、模型 ID |
+
+匯出後，Claude 還會檢查遮蔽版裡有沒有規則抓不到的個資（例如一般句子裡的人名），有的話會建議你加上遮蔽字詞重新匯出。`manifest.json` 同時記錄遮蔽版和未遮蔽原始檔的 SHA-256。遮蔽結果是確定性的，所以必要時可以證明遮蔽版確實來自你保存的原始檔。
 
 ## 安裝
 
@@ -69,6 +81,9 @@ uv run --with reportlab python skills/ai-audit-trail/scripts/export_audit_trail.
 | `--max-chars N` | PDF 中每個區塊的字數上限，預設 20000，`0` 表示不截斷 |
 | `--no-thinking` | PDF 不放推理摘要 |
 | `--no-zip` | 不產生 zip |
+| `--redact-term 字詞` | 額外要遮蔽的字詞（可以重複使用） |
+| `--no-redact` | 封存包裡放未遮蔽的原始檔 |
+| `--no-private-copy` | 不在 `.PRIVATE/` 保存未遮蔽的原始檔 |
 
 ## 驗證
 
@@ -81,7 +96,7 @@ openssl ts -verify -data SHA256SUMS -in SHA256SUMS.tsr -CAfile cacert.pem
 
 ## 注意
 
-- **隱私**：`raw/` 裡包含完整系統訊息、檔案路徑、帳號 email，以及 AI 讀過的檔案內容。提交前請先確認哪些可以公開。
+- **隱私**：遮蔽靠規則比對加上 AI 複查，提交前請自己再看一次。圖片和截圖不會被遮蔽。`.PRIVATE/` 資料夾絕對不要提交。
 - **保存期限**：Claude Code 預設會刪除 30 天以前的對話紀錄（設定項 `cleanupPeriodDays`）。長期研究建議把它調大，或定期匯出。
 - **適用範圍**：只支援 Claude Code 的對話。claude.ai 網頁版請用網頁內建的資料匯出功能。
 - **法律效力**：這個工具提供技術上的完整性證明，但不代表任何單位一定會採認。請以你所屬單位或期刊的規定為準。

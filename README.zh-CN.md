@@ -20,13 +20,25 @@
 ```
 ai-audit-trail_<UTC时间>_<session前8位>/
 ├── transcript.pdf   可读版：封面元数据＋逐条对话（提问、回复、推理摘要、工具调用与结果）
-├── raw/*.jsonl      Claude Code 原始记录（原始证据，含子代理记录）
-├── manifest.json    模型、Claude Code 版本、起止时间、论文信息、各文件 SHA-256
+├── transcripts/     已脱敏的 Claude Code 记录 JSONL（含子代理记录）
+├── manifest.json    模型、Claude Code 版本、起止时间、论文信息、脱敏统计、各文件脱敏前后的 SHA-256
 ├── SHA256SUMS       所有文件的哈希值
 ├── SHA256SUMS.tsr   （可选）RFC 3161 第三方可信时间戳
 └── README.txt       给审稿人的验证说明
 ```
-另外会生成同名的 `.zip`。
+另外会生成同名的 `.zip`，以及一个独立的 `….PRIVATE/` 文件夹，里面是未脱敏的原始文件。该文件夹仅供你自己保存，不会被打包进 zip。
+
+## 默认保护个人信息
+
+可提交的归档包会删除系统消息、对个人信息脱敏，但保留对话内容和 **AI 读取过的文件内容**：
+
+| | 内容 |
+|---|---|
+| **删除** | 系统提示词、环境／账号／组织信息、`<system-reminder>` 区块、内部遥测字段 |
+| **替换为 `[REDACTED:类别]`** | 邮箱、主目录路径中的用户名、git 姓名与邮箱、主机名、账号／组织 UUID、API 密钥／token／密码／私钥、台湾身份证号、电话、公网 IP，以及你用 `--redact-term` 指定的词（例如真实姓名、学号） |
+| **保留** | 提问、回复、推理摘要、工具调用与结果、AI 读取的文件内容、附件、时间戳、模型 ID |
+
+导出后，Claude 还会检查脱敏版本中是否有规则无法识别的个人信息（例如普通句子里的人名），如有会建议你添加脱敏词后重新导出。`manifest.json` 同时记录脱敏版和未脱敏原始文件的 SHA-256。脱敏结果是确定性的，因此必要时可以证明脱敏版确实来自你保存的原始文件。
 
 ## 安装
 
@@ -69,6 +81,9 @@ uv run --with reportlab python skills/ai-audit-trail/scripts/export_audit_trail.
 | `--max-chars N` | PDF 中每个区块的字数上限，默认 20000，`0` 表示不截断 |
 | `--no-thinking` | PDF 中不包含推理摘要 |
 | `--no-zip` | 不生成 zip |
+| `--redact-term 词` | 额外需要脱敏的词（可重复使用） |
+| `--no-redact` | 归档包中放入未脱敏的原始文件 |
+| `--no-private-copy` | 不在 `.PRIVATE/` 中保存未脱敏的原始文件 |
 
 ## 验证
 
@@ -81,7 +96,7 @@ openssl ts -verify -data SHA256SUMS -in SHA256SUMS.tsr -CAfile cacert.pem
 
 ## 注意事项
 
-- **隐私**：`raw/` 中包含完整的系统消息、文件路径、账号邮箱，以及 AI 读取过的文件内容。提交前请先确认哪些内容可以公开。
+- **隐私**：脱敏依靠规则匹配加 AI 复查，提交前请自己再检查一遍。图片和截图不会被脱敏。切勿提交 `.PRIVATE/` 文件夹。
 - **保留期限**：Claude Code 默认会删除 30 天以前的对话记录（配置项 `cleanupPeriodDays`）。长期研究建议调大该值，或定期导出。
 - **适用范围**：仅支持 Claude Code 的对话。claude.ai 网页版请使用网页内置的数据导出功能。
 - **法律效力**：本工具提供技术层面的完整性证明，但不代表任何机构一定会认可。请以你所在机构或期刊的规定为准。

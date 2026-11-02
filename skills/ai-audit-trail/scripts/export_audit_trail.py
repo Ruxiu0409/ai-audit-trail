@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """ai-audit-trail: export Claude Code conversation transcripts as an
-audit package (PDF + raw JSONL + SHA-256 manifest) for academic review.
+audit package (PDF + redacted JSONL + SHA-256 manifest) for academic review.
+
+Personal data (account email, home-directory user name, git identity,
+hostname, phone numbers, national IDs, public IPs, API keys/tokens) and
+system messages are removed from everything in the shareable package.
+Conversation content, including the contents of files the AI read, is kept.
+The untouched originals go to a separate .PRIVATE folder that is never zipped.
 
 Run with:  uv run --with reportlab python export_audit_trail.py [options]
 """
@@ -8,13 +14,16 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import getpass
 import hashlib
 import html
+import ipaddress
 import json
 import os
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import zipfile
@@ -22,7 +31,7 @@ from collections import Counter
 from pathlib import Path
 
 TOOL_NAME = "ai-audit-trail"
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "1.1.0"
 DEFAULT_MAX_CHARS = 20000
 
 # ---------------------------------------------------------------------------
@@ -52,18 +61,25 @@ def subagent_files(session_file: Path) -> list[Path]:
     return sorted(d.glob("*.jsonl")) if d.is_dir() else []
 
 
-def read_jsonl(path: Path) -> list[dict]:
+def parse_jsonl(text: str) -> list[dict]:
     out = []
-    with path.open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:
-                out.append({"type": "_unparseable", "raw": line})
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            out.append({"type": "_unparseable", "raw": line})
     return out
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    return parse_jsonl(path.read_text(encoding="utf-8", errors="replace"))
+
+
+def dump_jsonl(entries: list[dict]) -> bytes:
+    return "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in entries).encode("utf-8")
 
 
 def session_title(entries: list[dict]) -> str:
@@ -89,6 +105,200 @@ def list_sessions(cwd: Path) -> None:
         n_user = sum(1 for e in entries if e.get("type") == "user" and is_human_prompt(e))
         print(f"{p.stem}  {stamps[0][:16] if stamps else '?':16} → {stamps[-1][:16] if stamps else '?':16}"
               f"  提問 {n_user:3d} 則  {session_title(entries)}")
+
+
+# ---------------------------------------------------------------------------
+# Redaction: drop system messages, mask personal data, keep conversation
+# ---------------------------------------------------------------------------
+
+KEEP_ENTRY_TYPES = {"user", "assistant", "attachment", "ai-title", "summary", "custom-title"}
+KEEP_ENTRY_FIELDS = {"type", "uuid", "parentUuid", "logicalParentUuid", "timestamp", "sessionId", "agentId",
+                     "version", "entrypoint", "cwd", "gitBranch", "isSidechain", "isCompactSummary",
+                     "message", "attachment", "aiTitle", "summary", "customTitle", "leafUuid"}
+KEEP_MESSAGE_FIELDS = {"id", "type", "role", "model", "content", "stop_reason"}
+DROP_BLOCK_FIELDS = {"signature", "caller", "cache_control"}
+# Attachments are mostly system context; keep only those carrying file content the AI read.
+FILE_ATTACHMENT_RE = re.compile(r"file|directory|selected_lines|pdf|image|notebook", re.I)
+
+SYSTEM_TAG_RE = re.compile(r"<(system-reminder)>.*?</\1>\s*", re.S)
+SECRET_RES = [
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
+    re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{16,}"),
+    re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_\-]{20,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"\bxox[abposr]-[A-Za-z0-9\-]{10,}"),
+    re.compile(r"\bAIza[0-9A-Za-z_\-]{35}"),
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"),
+]
+SECRET_ASSIGN_RE = re.compile(
+    r"(?i)(\bbearer\s+|\b(?:api[_-]?key|access[_-]?key|secret|token|passw(?:or)?d)[\"']?\s*[:=]\s*[\"']?)"
+    r"(?!\[REDACTED)([^\s\"'`,;]{8,})")
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
+EMAIL_ALLOW = {"noreply@anthropic.com", "noreply@github.com"}
+HOME_RE = re.compile(r"(/Users/|/home/|[A-Za-z]:\\{1,2}Users\\{1,2})([^/\\\s\"'`:]+)")
+HOME_KEEP = {"Shared", "Public", "[REDACTED:USER]"}
+TWID_RE = re.compile(r"\b[A-Z][12]\d{8}\b")
+PHONE_RES = [
+    re.compile(r"(?<![\w+])(?:\+886[\s\-]?|0)9\d{2}[\s\-]?\d{3}[\s\-]?\d{3}(?!\d)"),
+    re.compile(r"(?<![\w+])\+\d{1,3}[\s\-]\(?\d{1,4}\)?[\s\-]\d{3,4}[\s\-]?\d{3,4}(?!\d)"),
+]
+IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+# Keys in Claude Code's own metadata whose values identify the account or organization.
+ID_KEY_RE = re.compile(r"(?i)^(?:org|organization|account|user)_?(?:uuid|id)$|^(?:user)?email(?:address)?$")
+TERM_STOPLIST = {"root", "admin", "user", "users", "localhost", "runner", "ubuntu", "mac", "home", "claude"}
+
+
+def auto_identity_terms(cwd: Path) -> list[str]:
+    """Identifiers of the person running the export, detected locally."""
+    terms = set()
+    try:
+        terms.add(getpass.getuser())
+    except Exception:  # noqa: BLE001
+        pass
+    for key in ("user.name", "user.email"):
+        try:
+            v = subprocess.run(["git", "config", "--get", key], cwd=cwd, capture_output=True,
+                               text=True, timeout=5).stdout.strip()
+            if v:
+                terms.add(v)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    host = socket.gethostname().split(".")[0]
+    if host:
+        terms.add(host)
+    return sorted(t for t in terms if len(t) >= 4 and t.lower() not in TERM_STOPLIST)
+
+
+class Redactor:
+    def __init__(self, cwd: Path, extra_terms: list[str]):
+        self.counts: Counter = Counter()
+        self.auto_terms = auto_identity_terms(cwd)
+        self.extra_terms = [t for t in extra_terms if t.strip()]
+        self._compile()
+
+    def _compile(self):
+        self.term_res = [(cat, self._term_re(terms)) for cat, terms in
+                         (("TERM", self.extra_terms), ("IDENTITY", self.auto_terms)) if terms]
+
+    def learn(self, entries: list[dict]) -> None:
+        """Pick up account identifiers from the transcript's own metadata (account email,
+        organization/account UUIDs) so they are also masked wherever they were echoed,
+        e.g. in tool output, and so are fragments such as the email's local part."""
+        found = set()
+
+        def walk(o, key=""):
+            if isinstance(o, dict):
+                if o.get("type") == "base64":
+                    return
+                for k, v in o.items():
+                    walk(v, k)
+            elif isinstance(o, list):
+                for v in o:
+                    walk(v, key)
+            elif isinstance(o, str):
+                if ID_KEY_RE.search(key) and len(o) >= 6 and " " not in o.strip():
+                    found.add(o.strip())
+                for m in EMAIL_RE.finditer(o):
+                    addr = m.group(0)
+                    if addr.lower() in EMAIL_ALLOW or addr.lower().startswith("git@"):
+                        continue
+                    found.add(addr)
+                    local = addr.split("@")[0]
+                    if len(local) >= 5:
+                        found.add(local)
+        walk(entries)
+        new = {t for t in found if len(t) >= 4 and t.lower() not in TERM_STOPLIST} - set(self.auto_terms)
+        if new:
+            self.auto_terms = sorted(set(self.auto_terms) | new)
+            self._compile()
+
+    @staticmethod
+    def _term_re(terms: list[str]):
+        parts = []
+        for t in sorted(set(terms), key=len, reverse=True):
+            e = re.escape(t)
+            parts.append(f"(?<![A-Za-z0-9]){e}(?![A-Za-z0-9])" if t.isascii() else e)
+        return re.compile("|".join(parts), re.I)
+
+    def _sub(self, regex, cat, s, repl=None):
+        def f(m):
+            self.counts[cat] += 1
+            return repl(m) if repl else f"[REDACTED:{cat}]"
+        return regex.sub(f, s)
+
+    def redact_str(self, s: str) -> str:
+        if not s:
+            return s
+        s = self._sub(SYSTEM_TAG_RE, "SYSTEM-MESSAGE", s, lambda m: "")
+        for r in SECRET_RES:
+            s = self._sub(r, "SECRET", s)
+        s = self._sub(SECRET_ASSIGN_RE, "SECRET", s, lambda m: m.group(1) + "[REDACTED:SECRET]")
+
+        def email(m):
+            if m.group(0).lower() in EMAIL_ALLOW or m.group(0).lower().startswith("git@"):
+                self.counts["EMAIL"] -= 1
+                return m.group(0)
+            return "[REDACTED:EMAIL]"
+        s = self._sub(EMAIL_RE, "EMAIL", s, email)
+
+        def home(m):
+            if m.group(2) in HOME_KEEP or m.group(2).startswith("<"):
+                self.counts["USER"] -= 1
+                return m.group(0)
+            return m.group(1) + "[REDACTED:USER]"
+        s = self._sub(HOME_RE, "USER", s, home)
+        for cat, r in self.term_res:
+            s = self._sub(r, cat, s)
+        s = self._sub(TWID_RE, "NATIONAL-ID", s)
+        for r in PHONE_RES:
+            s = self._sub(r, "PHONE", s)
+
+        def ip(m):
+            try:
+                if ipaddress.ip_address(m.group(0)).is_global:
+                    return "[REDACTED:IP]"
+            except ValueError:
+                pass
+            self.counts["IP"] -= 1
+            return m.group(0)
+        return self._sub(IPV4_RE, "IP", s, ip)
+
+    def redact_obj(self, o):
+        if isinstance(o, str):
+            return self.redact_str(o)
+        if isinstance(o, list):
+            return [self.redact_obj(x) for x in o]
+        if isinstance(o, dict):
+            if o.get("type") == "base64" and "data" in o:  # binary image payload
+                return {k: (v if k == "data" else self.redact_obj(v)) for k, v in o.items()}
+            return {k: self.redact_obj(v) for k, v in o.items()}
+        return o
+
+    def clean_entry(self, e: dict) -> dict | None:
+        t = e.get("type")
+        if t not in KEEP_ENTRY_TYPES or e.get("isMeta"):
+            self.counts["dropped-system-entries"] += 1
+            return None
+        if t == "attachment" and not FILE_ATTACHMENT_RE.search(str((e.get("attachment") or {}).get("type", ""))):
+            self.counts["dropped-system-entries"] += 1
+            return None
+        out = {k: v for k, v in e.items() if k in KEEP_ENTRY_FIELDS}
+        msg = out.get("message")
+        if isinstance(msg, dict):
+            msg = {k: v for k, v in msg.items() if k in KEEP_MESSAGE_FIELDS}
+            if isinstance(msg.get("content"), list):
+                msg["content"] = [{k: v for k, v in b.items() if k not in DROP_BLOCK_FIELDS}
+                                  if isinstance(b, dict) else b for b in msg["content"]]
+            out["message"] = msg
+        return self.redact_obj(out)
+
+    def clean(self, entries: list[dict]) -> list[dict]:
+        return [c for c in (self.clean_entry(e) for e in entries) if c is not None]
+
+    def summary(self) -> dict:
+        return {k: v for k, v in sorted(self.counts.items()) if v > 0}
 
 
 # ---------------------------------------------------------------------------
@@ -137,12 +347,14 @@ def to_events(entries: list[dict]) -> list[dict]:
             if e.get("isMeta"):
                 continue
             if isinstance(c, str):
-                events.append({"kind": "user", "ts": ts, "text": c})
+                if c.strip():
+                    events.append({"kind": "user", "ts": ts, "text": c})
                 continue
             for b in c or []:
                 bt = b.get("type")
                 if bt == "text":
-                    events.append({"kind": "user", "ts": ts, "text": b.get("text", "")})
+                    if b.get("text", "").strip():
+                        events.append({"kind": "user", "ts": ts, "text": b.get("text", "")})
                 elif bt == "image":
                     events.append({"kind": "user", "ts": ts, "text": "[使用者附加圖片，詳見原始 JSONL]"})
                 elif bt == "tool_result":
@@ -150,6 +362,15 @@ def to_events(entries: list[dict]) -> list[dict]:
                                    "id": b.get("tool_use_id", ""),
                                    "error": bool(b.get("is_error")),
                                    "text": block_text(b.get("content"))})
+        elif t == "attachment":
+            att = e.get("attachment") or {}
+            if not FILE_ATTACHMENT_RE.search(str(att.get("type", ""))):
+                continue
+            name = att.get("filename") or att.get("path") or att.get("displayPath") or ""
+            body = {k: v for k, v in att.items() if k not in ("type", "filename", "path", "displayPath")}
+            events.append({"kind": "attachment", "ts": ts, "name": f"{att.get('type', '')} {name}".strip(),
+                           "text": block_text(body.get("content")) if set(body) == {"content"}
+                           else json.dumps(body, ensure_ascii=False, indent=2)})
         elif t == "assistant":
             msg = e.get("message", {})
             model = msg.get("model", "")
@@ -203,7 +424,6 @@ def session_metadata(path: Path, entries: list[dict]) -> dict:
         "session_id": path.stem,
         "session_ids_in_file": sorted(session_ids),
         "title": session_title(entries),
-        "source_file": str(path),
         "source_sha256": sha256_file(path),
         "source_bytes": path.stat().st_size,
         "first_timestamp_utc": stamps[0] if stamps else None,
@@ -331,7 +551,7 @@ class Renderer:
         if self.max_chars and len(text) > self.max_chars:
             omitted = len(text) - self.max_chars
             return (text[: self.max_chars] +
-                    f"\n\n…［PDF 為求可讀已省略後續 {omitted:,} 字元；完整內容保存在原始 JSONL "
+                    f"\n\n…［PDF 為求可讀已省略後續 {omitted:,} 字元；完整內容保存在 transcripts/ 的 JSONL "
                     f"(SHA-256 {source_hash[:16]}…)］")
         return text
 
@@ -371,20 +591,25 @@ class Renderer:
             ("匯出時間 (本地)", info["exported_at_local"]),
             ("匯出工具", f"{TOOL_NAME} v{TOOL_VERSION}"),
             ("匯出環境", info["host"]),
-            ("PDF 字型", self.font_source),
+            ("PDF 字型", Path(self.font_source).name),
             ("包含工作階段數", str(len(sessions))),
+            ("個資與系統訊息", "已遮蔽／移除（類別與次數見 manifest.json）" if info.get("redacted")
+             else "未遮蔽（完整原始紀錄）"),
         ]
         story.append(self.kv_table(rows))
         story.append(Spacer(1, 5 * mm))
         story.append(self.para(
-            "說明：本 PDF 是對話紀錄的可讀版本。具法律與稽核效力的原始資料是同一封存包內的 raw/*.jsonl 檔案；"
-            "各檔案的 SHA-256 雜湊值列在 manifest.json 與 SHA256SUMS。若任何檔案在封存後被修改，"
-            "雜湊值就會對不上。PDF 本身的雜湊值也記錄在 SHA256SUMS 中。", "small"))
+            "說明：本 PDF 是對話紀錄的可讀版本，機器可讀的版本是同一封存包內的 transcripts/*.jsonl。"
+            "各檔案的 SHA-256 雜湊值列在 manifest.json 與 SHA256SUMS，任何檔案在封存後被修改，雜湊值就會對不上。"
+            + ("為保護個人資料，帳號 email、使用者名稱、金鑰、電話、身分證字號等已替換為 [REDACTED:類別]，"
+               "系統訊息已移除；對話內容與 AI 讀取的檔案內容皆完整保留。未遮蔽的原始紀錄由提交者另行保存，"
+               "其 SHA-256 記載於下方「原始檔 SHA-256」，必要時可提供比對。" if info.get("redacted") else ""),
+            "small"))
         story.append(Spacer(1, 3 * mm))
         story.append(self.para(
             "圖例：【使用者】研究者輸入；【AI 回覆】模型輸出；【AI 推理摘要】模型的推理過程（若有）；"
-            "【工具呼叫】/【工具結果】AI 代理執行的指令與其輸出；【系統摘要】對話過長時自動產生的上下文壓縮摘要。"
-            "系統提示詞與內部設定未列入 PDF，但完整保存在原始 JSONL。", "small"))
+            "【工具呼叫】/【工具結果】AI 代理執行的指令與其輸出（含 AI 讀取的檔案內容）；【附加檔案】使用者附加給 AI 的檔案；"
+            "【系統摘要】對話過長時自動產生的上下文壓縮摘要。", "small"))
 
         for idx, s in enumerate(sessions, 1):
             meta, events = s["meta"], s["events"]
@@ -402,8 +627,9 @@ class Renderer:
                 ("Git 分支", "、".join(meta["git_branches"]) or "—"),
                 ("統計", f"使用者提問 {meta['counts']['user_prompts']} 則、AI 文字回覆 "
                          f"{meta['counts']['assistant_text_blocks']} 段、工具呼叫 {meta['counts']['tool_calls']} 次"),
-                ("原始檔", meta["archived_as"]),
-                ("原始檔 SHA-256", meta["source_sha256"]),
+                ("封存檔", meta["archived_as"]),
+                ("封存檔 SHA-256", meta["source_sha256"]),
+                ("原始檔 SHA-256" + ("（遮蔽前）" if info.get("redacted") else ""), meta["original_sha256"]),
             ]))
             if s.get("subagents"):
                 story.append(Spacer(1, 2 * mm))
@@ -415,7 +641,7 @@ class Renderer:
             for sa in s.get("subagents", []):
                 story.append(PageBreak())
                 story.append(self.para(f"子代理紀錄：{Path(sa['archived_as']).name}", "h2"))
-                story.append(self.para(f"SHA-256 {sa['source_sha256']}", "small"))
+                story.append(self.para(f"封存檔 SHA-256 {sa['source_sha256']}", "small"))
                 story += self.render_events(sa["events"], sa["source_sha256"])
 
         footer_hash = sessions[0]["meta"]["source_sha256"][:16] if sessions else ""
@@ -467,6 +693,9 @@ class Renderer:
                 status = "（錯誤）" if ev["error"] else ""
                 out.append(self.para(f"【工具結果】{tool_names.get(ev['id'], '')}{status} · {ts}", "label"))
                 out.append(self.para(self.clip(ev["text"] or "（無輸出）", source_hash), "code"))
+            elif k == "attachment":
+                out.append(self.para(f"【附加檔案】{ev['name']} · {ts}", "label"))
+                out.append(self.para(self.clip(ev["text"] or "（無內容）", source_hash), "code"))
             elif k == "compact":
                 out.append(self.para(f"【系統摘要】對話自動壓縮 · {ts}", "label"))
                 out.append(self.para(self.clip(ev["text"], source_hash), "think"))
@@ -483,10 +712,10 @@ README_TEXT = """AI 協作紀錄封存包（{tool} v{ver}）
 本資料夾由 {tool} 於 {when} (UTC) 產生，內容如下：
 
   transcript.pdf   對話紀錄的可讀版本（給審查者閱讀）
-  raw/             Claude Code 原始對話紀錄 JSONL（未經修改的原始證據）
+  transcripts/     Claude Code 對話紀錄 JSONL（機器可讀）
   manifest.json    詮釋資料：模型、版本、時間、論文資訊與每個檔案的 SHA-256
   SHA256SUMS       所有檔案的 SHA-256 雜湊值
-{tsa_line}
+{tsa_line}{redaction_note}
 如何驗證檔案沒有被修改
 ----------------------
 macOS / Linux：在本資料夾執行
@@ -494,9 +723,34 @@ macOS / Linux：在本資料夾執行
 Windows PowerShell：
     Get-FileHash -Algorithm SHA256 <檔名>
 並與 SHA256SUMS 中的值比對。全部顯示 OK 即代表檔案與封存當下完全一致。
-{tsa_verify}
-注意：raw/ 中的原始紀錄包含完整系統訊息與工作環境資訊（例如路徑、帳號 email），
-提交給第三方前請先確認可公開的範圍。
+{tsa_verify}"""
+
+REDACTION_NOTE = """
+個人資料保護
+------------
+為保護個人資料，本封存包已做以下處理（各類別次數見 manifest.json 的 redaction）：
+  - 移除系統訊息與內部設定（系統提示詞、帳號與組織資訊、環境資訊等）
+  - 帳號 email、使用者名稱、git 身分、主機名稱、電話、身分證字號、公開 IP、
+    API 金鑰與密碼等，替換為 [REDACTED:類別]
+對話內容（使用者提問、AI 回覆、工具呼叫與結果、AI 讀取的檔案內容）完整保留。
+未遮蔽的原始紀錄由提交者另行保存；其 SHA-256 記載於 manifest.json 的
+original_sha256，必要時可提供原始檔比對。
+"""
+
+NO_REDACTION_NOTE = """
+注意：transcripts/ 為未遮蔽的完整原始紀錄，包含系統訊息與工作環境資訊
+（例如路徑、帳號 email），提交給第三方前請先確認可公開的範圍。
+"""
+
+PRIVATE_README = """這是未遮蔽的原始對話紀錄（{tool} v{ver}，{when} UTC）
+==================================================
+
+請勿提交、上傳或分享這個資料夾。它包含完整的系統訊息、帳號 email、
+檔案路徑等個人資料，只供你自己保存，在審查單位要求時用來證明遮蔽版的來源。
+
+對應的封存包：{pkg}
+驗證：在本資料夾執行  shasum -a 256 -c SHA256SUMS
+其中 raw/ 各檔的雜湊值應與封存包 manifest.json 裡的 original_sha256 相同。
 """
 
 TSA_LINE = "  SHA256SUMS.tsr   （若申請成功才會有）第三方可信時間戳記（RFC 3161），證明 SHA256SUMS 於該時間點已存在\n"
@@ -504,6 +758,16 @@ TSA_VERIFY = """
 驗證可信時間戳（需要 TSA 的 CA 憑證，例如 FreeTSA 的 cacert.pem）：
     openssl ts -verify -data SHA256SUMS -in SHA256SUMS.tsr -CAfile cacert.pem
 """
+
+
+def write_sums(folder: Path) -> Path:
+    sums = folder / "SHA256SUMS"
+    lines = []
+    for f in sorted(folder.rglob("*")):
+        if f.is_file() and f.name not in ("SHA256SUMS", "SHA256SUMS.tsq", "SHA256SUMS.tsr"):
+            lines.append(f"{sha256_file(f)}  {f.relative_to(folder).as_posix()}")
+    sums.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return sums
 
 
 def main() -> int:
@@ -523,6 +787,12 @@ def main() -> int:
     ap.add_argument("--author", default="")
     ap.add_argument("--affiliation", default="")
     ap.add_argument("--note", default="")
+    ap.add_argument("--redact-term", action="append", default=[],
+                    help="Extra word to mask everywhere, e.g. a real name or student ID (repeatable).")
+    ap.add_argument("--no-redact", action="store_true",
+                    help="Put the untouched originals in the package (no masking, system messages kept).")
+    ap.add_argument("--no-private-copy", action="store_true",
+                    help="Do not keep the unredacted originals in a separate .PRIVATE folder.")
     ap.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS,
                     help=f"Max characters per block in the PDF (0 = no limit, default {DEFAULT_MAX_CHARS}).")
     ap.add_argument("--no-thinking", action="store_true", help="Omit reasoning summaries from the PDF.")
@@ -566,32 +836,62 @@ def main() -> int:
 
     now = dt.datetime.now(dt.timezone.utc)
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
+    default_out = args.out is None
     out_parent = (args.out or args.cwd / "ai-audit-trail-exports").expanduser().resolve()
+    out_parent.mkdir(parents=True, exist_ok=True)
+    if default_out and not (out_parent / ".gitignore").exists():
+        # Keep exports (especially .PRIVATE originals) out of the user's git repo.
+        (out_parent / ".gitignore").write_text("*\n", encoding="utf-8")
     pkg = out_parent / f"ai-audit-trail_{stamp}_{files[0].stem[:8]}"
-    raw_dir = pkg / "raw"
-    raw_dir.mkdir(parents=True, exist_ok=False)
+    tx_dir = pkg / "transcripts"
+    tx_dir.mkdir(parents=True, exist_ok=False)
+
+    redactor = None if args.no_redact else Redactor(args.cwd, args.redact_term)
+    private = None
+    if redactor and not args.no_private_copy:
+        private = out_parent / f"{pkg.name}.PRIVATE"
+        (private / "raw").mkdir(parents=True, exist_ok=False)
+
+    def archive(src: Path, rel: Path) -> tuple[list[dict], dict]:
+        """Snapshot `src` once, keep the original privately, write the shareable copy."""
+        original = src.read_bytes()
+        entries = parse_jsonl(original.decode("utf-8", errors="replace"))
+        if private:
+            (private / "raw" / rel).parent.mkdir(parents=True, exist_ok=True)
+            (private / "raw" / rel).write_bytes(original)
+        if redactor:
+            entries = redactor.clean(entries)
+            data = dump_jsonl(entries)
+        else:
+            data = original
+        dest = tx_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        return entries, {"archived_as": dest.relative_to(pkg).as_posix(),
+                         "source_sha256": hashlib.sha256(data).hexdigest(),
+                         "original_sha256": hashlib.sha256(original).hexdigest(),
+                         "original_bytes": len(original)}
+
+    if redactor:
+        for p in files:
+            for src in [p, *subagent_files(p)]:
+                redactor.learn(read_jsonl(src))
 
     sessions = []
     for p in files:
-        # Snapshot first, then parse the snapshot, so hash and content always match.
-        dest = raw_dir / p.name
-        shutil.copy2(p, dest)
-        entries = read_jsonl(dest)
-        meta = session_metadata(dest, entries)
-        meta["original_path"] = str(p)
-        meta["archived_as"] = str(dest.relative_to(pkg))
+        entries, hashes = archive(p, Path(p.name))
+        meta = session_metadata(tx_dir / p.name, entries)
+        meta["session_id"] = p.stem
+        meta.update(hashes)
         subs = []
         for sp in subagent_files(p):
-            sdest = raw_dir / f"{p.stem}_subagents" / sp.name
-            sdest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(sp, sdest)
-            subs.append({"archived_as": str(sdest.relative_to(pkg)), "original_path": str(sp),
-                         "source_sha256": sha256_file(sdest), "events": to_events(read_jsonl(sdest))})
+            sentries, shashes = archive(sp, Path(f"{p.stem}_subagents") / sp.name)
+            subs.append({**shashes, "events": to_events(sentries)})
         sessions.append({"meta": meta, "events": to_events(entries), "subagents": subs})
 
     info = {
         "paper_title": args.paper_title, "section": args.section, "author": args.author,
-        "affiliation": args.affiliation, "note": args.note,
+        "affiliation": args.affiliation, "note": args.note, "redacted": bool(redactor),
         "exported_at_utc": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
         "exported_at_local": now.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z (UTC%z)"),
         "host": f"{platform.system()} {platform.release()} · Python {platform.python_version()}",
@@ -601,13 +901,29 @@ def main() -> int:
     pdf_path = pkg / "transcript.pdf"
     renderer.build(pdf_path, info, sessions)
 
+    redaction = None
+    if redactor:
+        redaction = {
+            "enabled": True,
+            "counts": redactor.summary(),
+            "auto_identity_terms": len(redactor.auto_terms),
+            "user_supplied_terms": len(redactor.extra_terms),
+            "removed": ["system messages and internal settings", "non-file attachments",
+                        "thinking signatures", "request/telemetry fields", "duplicated toolUseResult payloads"],
+            "kept": ["user prompts", "assistant replies", "reasoning summaries", "tool calls and results",
+                     "contents of files the AI read", "file attachments", "timestamps", "model IDs"],
+            "note": "Masked values are replaced with [REDACTED:<CATEGORY>]. The masked values themselves "
+                    "are not recorded anywhere in this package.",
+        }
     manifest = {
         "tool": {"name": TOOL_NAME, "version": TOOL_VERSION},
         "exported_at_utc": now.isoformat().replace("+00:00", "Z"),
         "exported_at_local": info["exported_at_local"],
         "environment": info["host"],
         "paper": {k: info[k] for k in ("paper_title", "section", "author", "affiliation", "note")},
-        "pdf": {"file": "transcript.pdf", "sha256": sha256_file(pdf_path), "font": renderer.font_source, "max_chars_per_block": args.max_chars,
+        "redaction": redaction or {"enabled": False},
+        "pdf": {"file": "transcript.pdf", "sha256": sha256_file(pdf_path),
+                "font": Path(renderer.font_source).name, "max_chars_per_block": args.max_chars,
                 "includes_thinking": not args.no_thinking},
         "sessions": [
             {**s["meta"], "subagents": [{k: v for k, v in sa.items() if k != "events"}
@@ -617,24 +933,20 @@ def main() -> int:
     }
     (pkg / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    tsa_ok, tsa_msg = False, ""
-    readme = pkg / "README.txt"
-
-    def write_sums() -> Path:
-        sums = pkg / "SHA256SUMS"
-        lines = []
-        for f in sorted(pkg.rglob("*")):
-            if f.is_file() and f.name not in ("SHA256SUMS", "SHA256SUMS.tsq", "SHA256SUMS.tsr"):
-                lines.append(f"{sha256_file(f)}  {f.relative_to(pkg).as_posix()}")
-        sums.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return sums
-
-    readme.write_text(README_TEXT.format(
+    (pkg / "README.txt").write_text(README_TEXT.format(
         tool=TOOL_NAME, ver=TOOL_VERSION, when=info["exported_at_utc"],
-        tsa_line=TSA_LINE if args.tsa else "", tsa_verify=TSA_VERIFY if args.tsa else ""), encoding="utf-8")
-    sums = write_sums()
+        tsa_line=TSA_LINE if args.tsa else "",
+        redaction_note=REDACTION_NOTE if redactor else NO_REDACTION_NOTE,
+        tsa_verify=TSA_VERIFY if args.tsa else ""), encoding="utf-8")
+    sums = write_sums(pkg)
+    tsa_ok, tsa_msg = False, ""
     if args.tsa:
         tsa_ok, tsa_msg = rfc3161_timestamp(sums, args.tsa)
+
+    if private:
+        (private / "README.txt").write_text(PRIVATE_README.format(
+            tool=TOOL_NAME, ver=TOOL_VERSION, when=info["exported_at_utc"], pkg=pkg.name), encoding="utf-8")
+        write_sums(private)
 
     zip_path = None
     if not args.no_zip:
@@ -650,9 +962,11 @@ def main() -> int:
         "pdf_sha256": sha256_file(pdf_path),
         "zip": str(zip_path) if zip_path else None,
         "zip_sha256": sha256_file(zip_path) if zip_path else None,
+        "private_originals": str(private) if private else None,
+        "redaction": redaction["counts"] if redaction else "disabled",
         "sessions": [{"session_id": s["meta"]["session_id"], "title": s["meta"]["title"],
-                      "sha256": s["meta"]["source_sha256"], "models": s["meta"]["models"],
-                      "subagents": len(s["subagents"])} for s in sessions],
+                      "sha256": s["meta"]["source_sha256"], "original_sha256": s["meta"]["original_sha256"],
+                      "models": s["meta"]["models"], "subagents": len(s["subagents"])} for s in sessions],
         "font": renderer.font_source,
         "tsa": None if not args.tsa else {"ok": tsa_ok, "detail": tsa_msg, "url": args.tsa},
     }

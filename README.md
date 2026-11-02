@@ -21,13 +21,26 @@ More universities, funders, and journals now ask researchers to keep a complete 
 ai-audit-trail_<UTC-time>_<session-prefix>/
 ├── transcript.pdf   Readable version: cover metadata + every turn (prompts, replies,
 │                    reasoning summaries, tool calls and results), all timestamped
-├── raw/*.jsonl      Original Claude Code transcripts, untouched (incl. subagents)
-├── manifest.json    Model IDs, Claude Code versions, time range, paper info, SHA-256 of each file
+├── transcripts/     Claude Code transcripts (JSONL) with personal data masked (incl. subagents)
+├── manifest.json    Model IDs, Claude Code versions, time range, paper info, masking stats,
+│                    SHA-256 of each file before and after masking
 ├── SHA256SUMS       Hashes of every file in the package
 ├── SHA256SUMS.tsr   (optional) RFC 3161 trusted timestamp
 └── README.txt       Verification instructions for reviewers
 ```
-It also produces a `.zip` of the package with the same name.
+It also produces a `.zip` of the package with the same name, plus a separate `….PRIVATE/` folder holding the unmasked originals. That folder is for you to keep and is never zipped.
+
+## Privacy by default
+
+The shareable package strips system messages and masks personal data, but keeps the conversation and **the contents of files the AI read**:
+
+| | What |
+|---|---|
+| **Removed** | System prompts, environment/account/organization context, `<system-reminder>` blocks, internal telemetry fields |
+| **Masked as `[REDACTED:<TYPE>]`** | Emails, the user name in home-directory paths, git name/email, hostname, account/organization UUIDs, API keys/tokens/passwords/private keys, Taiwan national IDs, phone numbers, public IPs, and any words you pass with `--redact-term` (e.g. your real name or student ID) |
+| **Kept** | Prompts, replies, reasoning summaries, tool calls and results, file contents the AI read, attachments, timestamps, model IDs |
+
+After exporting, Claude also reviews the masked transcript for personal data that the rules can't catch, such as names in free text, and offers to re-export with extra terms. `manifest.json` records the SHA-256 of both the masked file and the unmasked original. Masking is deterministic, so you can prove the masked version came from your private original.
 
 ## Install
 
@@ -70,6 +83,9 @@ uv run --with reportlab python skills/ai-audit-trail/scripts/export_audit_trail.
 | `--max-chars N` | Max characters per block in the PDF (default 20000, `0` = no limit) |
 | `--no-thinking` | Leave reasoning summaries out of the PDF |
 | `--no-zip` | Don't create a zip |
+| `--redact-term WORD` | Extra word to mask everywhere (repeatable) |
+| `--no-redact` | Put the unmasked originals in the package |
+| `--no-private-copy` | Don't keep the unmasked originals in `.PRIVATE/` |
 
 ## Verify
 
@@ -82,7 +98,7 @@ openssl ts -verify -data SHA256SUMS -in SHA256SUMS.tsr -CAfile cacert.pem
 
 ## Caveats
 
-- **Privacy:** `raw/` contains full system messages, file paths, account email, and the contents of files the AI read. Review it before sharing.
+- **Privacy:** Masking is rule-based plus an AI review, so read the package before you submit it. Images and screenshots are not masked. Never submit the `.PRIVATE/` folder.
 - **Retention:** Claude Code deletes transcripts older than `cleanupPeriodDays` (30 by default). For long-running research, raise that setting or export regularly.
 - **Scope:** Claude Code conversations only. For claude.ai, use its built-in data export.
 - **Legal standing:** This tool gives a technical proof of integrity. Whether it's accepted is up to your institution or journal.
